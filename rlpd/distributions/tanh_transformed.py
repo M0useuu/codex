@@ -1,8 +1,7 @@
 from typing import Any, Optional
 
-import tensorflow_probability
+from tensorflow_probability.substrates import jax as tfp
 
-tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
 tfb = tfp.bijectors
 
