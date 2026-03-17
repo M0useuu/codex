@@ -36,6 +36,7 @@ class DualAdaptiveLearner(Agent):
     action_selection_temperature: float = struct.field(pytree_node=False)
     ensemble_ratio: float = struct.field(pytree_node=False)
     actor_bc_coef: float = struct.field(pytree_node=False)
+    alpha_multiplier: float = struct.field(pytree_node=False)
 
     @classmethod
     def create(
@@ -62,6 +63,7 @@ class DualAdaptiveLearner(Agent):
         action_selection_temperature: float = 1.0,
         ensemble_ratio: float = 0.5,
         actor_bc_coef: float = 0.5,
+        alpha_multiplier: float = 1.0,
     ):
         action_dim = action_space.shape[-1]
         observations = observation_space.sample()
@@ -163,6 +165,7 @@ class DualAdaptiveLearner(Agent):
             action_selection_temperature=action_selection_temperature,
             ensemble_ratio=ensemble_ratio,
             actor_bc_coef=actor_bc_coef,
+            alpha_multiplier=alpha_multiplier,
         )
 
     def _q_for_action(self, observations: jnp.ndarray, actions: jnp.ndarray, critic: TrainState):
@@ -205,7 +208,8 @@ class DualAdaptiveLearner(Agent):
 
         q1 = self._q_for_action(obs, a1, self.critic)
         q2 = self._q_for_action(obs, a2, self.critic2)
-        idx = jnp.argmax(jnp.stack([q1, q2], axis=-1), axis=-1)
+        logits = jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature
+        idx = jnp.argmax(logits, axis=-1)
         return jnp.where(idx[:, None] == 0, a1, a2)
 
     def sample_actions(self, observations: np.ndarray) -> Tuple[np.ndarray, Agent]:
@@ -288,8 +292,8 @@ class DualAdaptiveLearner(Agent):
         mixed1 = q1_next + ratio1 * gap1
 
         if self.backup_entropy:
-            temp1 = self.temp.apply_fn({"params": self.temp.params})
-            temp2 = self.temp2.apply_fn({"params": self.temp2.params})
+            temp1 = self.alpha_multiplier * self.temp.apply_fn({"params": self.temp.params})
+            temp2 = self.alpha_multiplier * self.temp2.apply_fn({"params": self.temp2.params})
             mixed0 = mixed0 - temp1 * dist1.log_prob(next_actions1)
             mixed1 = mixed1 - temp2 * dist2.log_prob(next_actions2)
 
@@ -380,7 +384,7 @@ class DualAdaptiveLearner(Agent):
                 rngs={"dropout": key2},
             )
             q0 = jnp.minimum(q0_all[0], q0_all[1])
-            alpha0 = self.temp.apply_fn({"params": self.temp.params})
+            alpha0 = self.alpha_multiplier * self.temp.apply_fn({"params": self.temp.params})
             policy_loss0 = (alpha0 * log_pi0 - q0).mean()
             bc_loss0 = -dist0.log_prob(batch["actions"]).mean()
             actor_loss0 = policy_loss0 + self.actor_bc_coef * bc_loss0
@@ -396,7 +400,7 @@ class DualAdaptiveLearner(Agent):
                 rngs={"dropout": key4},
             )
             q1 = jnp.minimum(q1_all[0], q1_all[1])
-            alpha1 = self.temp2.apply_fn({"params": self.temp2.params})
+            alpha1 = self.alpha_multiplier * self.temp2.apply_fn({"params": self.temp2.params})
             policy_loss1 = (alpha1 * log_pi1 - q1).mean()
             bc_loss1 = -dist1.log_prob(batch["actions"]).mean()
             actor_loss1 = policy_loss1 + self.actor_bc_coef * bc_loss1
@@ -407,10 +411,12 @@ class DualAdaptiveLearner(Agent):
                 "actor1_sac_loss": policy_loss0,
                 "actor1_bc_loss": bc_loss0,
                 "entropy1": -log_pi0.mean(),
+                "log_pi1": log_pi0.mean(),
                 "actor2_loss": actor_loss1,
                 "actor2_sac_loss": policy_loss1,
                 "actor2_bc_loss": bc_loss1,
                 "entropy2": -log_pi1.mean(),
+                "log_pi2": log_pi1.mean(),
             }
             return total_loss, info
 
@@ -427,16 +433,18 @@ class DualAdaptiveLearner(Agent):
             info,
         )
 
-    def _update_temperature(self, entropy1: float, entropy2: float):
+    def _update_temperature(self, log_pi1: float, log_pi2: float):
         def t1_loss_fn(temp_params):
-            t = self.temp.apply_fn({"params": temp_params})
-            loss = t * (entropy1 - self.target_entropy).mean()
-            return loss, {"temperature": t, "temperature_loss": loss}
+            log_temp = temp_params["log_temp"]
+            loss = -(log_temp * jax.lax.stop_gradient(log_pi1 + self.target_entropy)).mean()
+            temperature = self.alpha_multiplier * jnp.exp(log_temp)
+            return loss, {"temperature": temperature, "temperature_loss": loss}
 
         def t2_loss_fn(temp_params):
-            t = self.temp2.apply_fn({"params": temp_params})
-            loss = t * (entropy2 - self.target_entropy).mean()
-            return loss, {"temperature2": t, "temperature2_loss": loss}
+            log_temp = temp_params["log_temp"]
+            loss = -(log_temp * jax.lax.stop_gradient(log_pi2 + self.target_entropy)).mean()
+            temperature = self.alpha_multiplier * jnp.exp(log_temp)
+            return loss, {"temperature2": temperature, "temperature2_loss": loss}
 
         g1, i1 = jax.grad(t1_loss_fn, has_aux=True)(self.temp.params)
         g2, i2 = jax.grad(t2_loss_fn, has_aux=True)(self.temp2.params)
@@ -472,15 +480,21 @@ class DualAdaptiveLearner(Agent):
 
         new_agent, actor_info = new_agent._update_actor(mini_batch)
         new_agent, temp_info = new_agent._update_temperature(
-            actor_info["entropy1"], actor_info["entropy2"]
+            actor_info["log_pi1"], actor_info["log_pi2"]
         )
 
         return new_agent, {**critic_info, **actor_info, **temp_info}
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_offline(self, batch1: DatasetDict, batch2: DatasetDict, utd_ratio: int):
-        # Kept for API compatibility; online path uses update().
+        # Keep online/offline batch pairing aligned per UTD slice.
         merged_batch = {}
         for k in batch1.keys():
-            merged_batch[k] = jnp.concatenate([batch1[k], batch2[k]], axis=0)
+            online = batch1[k]
+            offline = batch2[k]
+            bs = online.shape[0] // utd_ratio
+            online = online.reshape((utd_ratio, bs, *online.shape[1:]))
+            offline = offline.reshape((utd_ratio, bs, *offline.shape[1:]))
+            merged = jnp.concatenate([online, offline], axis=1)
+            merged_batch[k] = merged.reshape((utd_ratio * (2 * bs), *online.shape[2:]))
         return self.update(merged_batch, utd_ratio)
