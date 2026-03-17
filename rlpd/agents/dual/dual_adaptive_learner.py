@@ -476,8 +476,8 @@ class DualAdaptiveLearner(Agent):
             q0 = jnp.minimum(q0_all[0], q0_all[1])
             alpha0 = self.alpha_multiplier * self.temp.apply_fn({"params": self.temp.params})
             policy_loss0 = (alpha0 * log_pi0 - q0).mean()
-            bc_loss0 = -dist0.log_prob(batch["actions"]).mean()
-            actor_loss0 = policy_loss0 + self.actor_bc_coef * bc_loss0
+            #bc_loss0 = -dist0.log_prob(batch["actions"]).mean()
+            actor_loss0 = policy_loss0
 
             dist1 = self.actor2.apply_fn({"params": actor_params1}, batch["observations"])
             new_actions1 = dist1.sample(seed=key3)
@@ -492,8 +492,8 @@ class DualAdaptiveLearner(Agent):
             q1 = jnp.minimum(q1_all[0], q1_all[1])
             alpha1 = self.alpha_multiplier * self.temp2.apply_fn({"params": self.temp2.params})
             policy_loss1 = (alpha1 * log_pi1 - q1).mean()
-            bc_loss1 = -dist1.log_prob(batch["actions"]).mean()
-            actor_loss1 = policy_loss1 + self.actor_bc_coef * bc_loss1
+            #bc_loss1 = -dist1.log_prob(batch["actions"]).mean()
+            actor_loss1 = policy_loss1
 
             total_loss = actor_loss0 + actor_loss1
             info = {
