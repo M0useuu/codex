@@ -499,12 +499,12 @@ class DualAdaptiveLearner(Agent):
             info = {
                 "actor1_loss": actor_loss0,
                 "actor1_sac_loss": policy_loss0,
-                "actor1_bc_loss": bc_loss0,
+                #"actor1_bc_loss": bc_loss0,
                 "entropy1": -log_pi0.mean(),
                 "log_pi1": log_pi0.mean(),
                 "actor2_loss": actor_loss1,
                 "actor2_sac_loss": policy_loss1,
-                "actor2_bc_loss": bc_loss1,
+                #"actor2_bc_loss": bc_loss1,
                 "entropy2": -log_pi1.mean(),
                 "log_pi2": log_pi1.mean(),
             }
