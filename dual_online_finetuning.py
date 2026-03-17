@@ -235,8 +235,8 @@ def main(_):
         if FLAGS.progress_interval > 0 and i > 0 and i % FLAGS.progress_interval == 0:
             now = time.time()
             dt = max(now - last_progress_time, 1e-6)
-            ds = i - last_progress_step
-            sps = ds / dt
+            delta_steps = i - last_progress_step
+            sps = delta_steps / dt
             phase = "warmup" if i < FLAGS.start_training else "training"
             tqdm.tqdm.write(
                 f"[progress] step={i} phase={phase} sps={sps:.2f} elapsed={now - loop_start_time:.1f}s"
