@@ -8,7 +8,7 @@ def get_config():
     config.hidden_dims = (256, 256, 256)
     
     config.action_selection_temperature = 1.0
-    config.ensemble_ratio = 0.5
+    config.ensemble_ratio = 1.0
     config.actor_bc_coef = 0.5
 
     return config
