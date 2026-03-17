@@ -1,7 +1,6 @@
 #! /usr/bin/env python
 import os
 import pickle
-import time
 
 import d4rl
 import d4rl.gym_mujoco
@@ -21,22 +20,6 @@ from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
 from rlpd.wrappers import wrap_gym
 
-# DEBUG_NAN_GUARD_START
-import numpy as np
-
-
-def _check_finite(name, value, step):
-    """Temporary debug guard to locate NaN/Inf sources during rollout."""
-    arr = np.asarray(value)
-    if not np.all(np.isfinite(arr)):
-        raise FloatingPointError(
-            "[DEBUG_NAN_GUARD] Non-finite value detected: "
-            f"name={name}, step={step}, shape={arr.shape}, "
-            f"min={np.nanmin(arr)}, max={np.nanmax(arr)}"
-        )
-
-
-# DEBUG_NAN_GUARD_END
 
 FLAGS = flags.FLAGS
 
@@ -70,11 +53,6 @@ flags.DEFINE_boolean(
     False,
     "Compile the jitted update function before online interaction. May take a long time on CPU.",
 )
-flags.DEFINE_integer(
-    "progress_interval",
-    1000,
-    "Write lightweight progress heartbeat every N steps.",
-)
 flags.DEFINE_string(
     "wandb_mode",
     "online",
@@ -87,16 +65,6 @@ flags.DEFINE_string(
     "offline_checkpoint_dir",
     None,
     "Absolute directory of offline CQL weights. Online finetuning loads agent1 and agent2 from this dir.",
-)
-flags.DEFINE_boolean(
-    "debug_nan_guard",
-    True,
-    "Temporary debug guard: checks observation/action/reward finite values to locate Mujoco NaNs.",
-)
-flags.DEFINE_integer(
-    "debug_nan_guard_log_interval",
-    1000,
-    "Temporary debug guard: print finite-range heartbeat every N steps (<=0 to disable).",
 )
 
 config_flags.DEFINE_config_file(
@@ -208,42 +176,14 @@ def main(_):
 
     latest_episode_metrics = None
     observation, done = env.reset(), False
-    if FLAGS.debug_nan_guard:
-        # DEBUG_NAN_GUARD
-        _check_finite("reset_observation", observation, step=0)
 
-    loop_start_time = time.time()
-    last_progress_time = loop_start_time
-    last_progress_step = 0
     for i in tqdm.tqdm(range(FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):
         if i < FLAGS.start_training:
             action = env.action_space.sample()
         else:
             action, agent = agent.sample_actions(observation)
 
-        if FLAGS.debug_nan_guard:
-            # DEBUG_NAN_GUARD
-            _check_finite("observation_before_step", observation, step=i)
-            _check_finite("action_before_step", action, step=i)
-            if (
-                FLAGS.debug_nan_guard_log_interval > 0
-                and i > 0
-                and i % FLAGS.debug_nan_guard_log_interval == 0
-            ):
-                obs_arr = np.asarray(observation)
-                act_arr = np.asarray(action)
-                tqdm.tqdm.write(
-                    "[DEBUG_NAN_GUARD] "
-                    f"step={i} obs[min,max]=({np.min(obs_arr):.4e},{np.max(obs_arr):.4e}) "
-                    f"act[min,max]=({np.min(act_arr):.4e},{np.max(act_arr):.4e})"
-                )
-
         next_observation, reward, done, info = env.step(action)
-        if FLAGS.debug_nan_guard:
-            # DEBUG_NAN_GUARD
-            _check_finite("next_observation_after_step", next_observation, step=i)
-            _check_finite("reward_after_step", reward, step=i)
-
         mask = 1.0 if (not done or "TimeLimit.truncated" in info) else 0.0
 
         replay_buffer.insert(
@@ -284,18 +224,6 @@ def main(_):
                 if latest_episode_metrics is not None:
                     train_metrics.update(prefixed(latest_episode_metrics, "training"))
                 wandb.log(train_metrics, step=i + FLAGS.pretrain_steps)
-
-        if FLAGS.progress_interval > 0 and i > 0 and i % FLAGS.progress_interval == 0:
-            now = time.time()
-            dt = max(now - last_progress_time, 1e-6)
-            delta_steps = i - last_progress_step
-            sps = delta_steps / dt
-            phase = "warmup" if i < FLAGS.start_training else "training"
-            tqdm.tqdm.write(
-                f"[progress] step={i} phase={phase} sps={sps:.2f} elapsed={now - loop_start_time:.1f}s"
-            )
-            last_progress_time = now
-            last_progress_step = i
 
         should_eval = i % FLAGS.eval_interval == 0 and (FLAGS.eval_at_step0 or i > 0)
         if should_eval:
