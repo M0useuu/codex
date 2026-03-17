@@ -5,7 +5,6 @@ import pickle
 import d4rl
 import d4rl.gym_mujoco
 import d4rl.locomotion
-import dmcgym
 import gym
 import tqdm
 import wandb
