@@ -449,16 +449,24 @@ class DualAdaptiveLearner(Agent):
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
-        new_agent = self
-        for i in range(utd_ratio):
+        bs = batch["observations"].shape[0] // utd_ratio
 
-            def slice_fn(x):
-                assert x.shape[0] % utd_ratio == 0
-                bs = x.shape[0] // utd_ratio
-                return x[bs * i : bs * (i + 1)]
+        def make_mini_batch(i):
+            return jax.tree_util.tree_map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, i * bs, bs, axis=0),
+                batch,
+            )
 
-            mini_batch = jax.tree_util.tree_map(slice_fn, batch)
-            new_agent, critic_info = new_agent._update_critic(mini_batch)
+        def critic_scan_fn(carry, i):
+            agent = carry
+            mini_batch = make_mini_batch(i)
+            agent, critic_info = agent._update_critic(mini_batch)
+            return agent, critic_info
+
+        new_agent, critic_infos = jax.lax.scan(critic_scan_fn, self, jnp.arange(utd_ratio))
+        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+
+        mini_batch = make_mini_batch(utd_ratio - 1)
 
         new_agent, actor_info = new_agent._update_actor(mini_batch)
         new_agent, temp_info = new_agent._update_temperature(

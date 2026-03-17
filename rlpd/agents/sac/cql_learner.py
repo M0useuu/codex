@@ -219,7 +219,10 @@ class CQLLearner(Agent):
         self, observations: jnp.ndarray, rng: jax.random.PRNGKey
     ) -> Tuple[jnp.ndarray, jnp.ndarray, jax.random.PRNGKey]:
         batch_size = observations.shape[0]
-        expanded_obs = jnp.repeat(observations, repeats=self.cql_n_actions, axis=0)
+        expanded_obs = jnp.broadcast_to(
+            observations[:, None, :],
+            (batch_size, self.cql_n_actions, observations.shape[-1]),
+        ).reshape(batch_size * self.cql_n_actions, observations.shape[-1])
         key, rng = jax.random.split(rng)
         dist = self.actor.apply_fn({"params": self.actor.params}, expanded_obs)
         actions = dist.sample(seed=key)
@@ -328,15 +331,17 @@ class CQLLearner(Agent):
 
             td_loss = ((qs - target_q) ** 2).mean()
 
-            q_rand = self.critic.apply_fn(
-                {"params": critic_params}, tiled_obs, random_actions_flat, True, rngs={"dropout": key}
-            ).reshape(self.num_qs, batch_size, self.cql_n_actions)
-            q_cur = self.critic.apply_fn(
-                {"params": critic_params}, tiled_obs, cur_actions_flat, True, rngs={"dropout": key}
-            ).reshape(self.num_qs, batch_size, self.cql_n_actions)
-            q_next = self.critic.apply_fn(
-                {"params": critic_params}, tiled_next_obs, next_actions_flat, True, rngs={"dropout": key}
-            ).reshape(self.num_qs, batch_size, self.cql_n_actions)
+            cql_obs = jnp.concatenate([tiled_obs, tiled_obs, tiled_next_obs], axis=0)
+            cql_actions = jnp.concatenate(
+                [random_actions_flat, cur_actions_flat, next_actions_flat], axis=0
+            )
+            cql_qs = self.critic.apply_fn(
+                {"params": critic_params}, cql_obs, cql_actions, True, rngs={"dropout": key}
+            )
+            q_rand, q_cur, q_next = jnp.split(cql_qs, 3, axis=1)
+            q_rand = q_rand.reshape(self.num_qs, batch_size, self.cql_n_actions)
+            q_cur = q_cur.reshape(self.num_qs, batch_size, self.cql_n_actions)
+            q_next = q_next.reshape(self.num_qs, batch_size, self.cql_n_actions)
 
             if self.cql_importance_sample:
                 cat_q = jnp.concatenate(
@@ -413,16 +418,24 @@ class CQLLearner(Agent):
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
-        new_agent = self
-        for i in range(utd_ratio):
+        batch_size = batch["observations"].shape[0] // utd_ratio
 
-            def slice_fn(x):
-                assert x.shape[0] % utd_ratio == 0
-                batch_size = x.shape[0] // utd_ratio
-                return x[batch_size * i : batch_size * (i + 1)]
+        def make_mini_batch(i):
+            return jax.tree_util.tree_map(
+                lambda x: jax.lax.dynamic_slice_in_dim(x, i * batch_size, batch_size, axis=0),
+                batch,
+            )
 
-            mini_batch = jax.tree_util.tree_map(slice_fn, batch)
-            new_agent, critic_info = new_agent.update_critic(mini_batch)
+        def critic_scan_fn(carry, i):
+            agent = carry
+            mini_batch = make_mini_batch(i)
+            agent, critic_info = agent.update_critic(mini_batch)
+            return agent, critic_info
+
+        new_agent, critic_infos = jax.lax.scan(critic_scan_fn, self, jnp.arange(utd_ratio))
+        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+
+        mini_batch = make_mini_batch(utd_ratio - 1)
 
         new_agent, actor_info = new_agent.update_actor(mini_batch)
         new_agent, temp_info = new_agent.update_temperature(actor_info["entropy"])
