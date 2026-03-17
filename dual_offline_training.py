@@ -14,6 +14,7 @@ from ml_collections import config_flags
 
 from cql_finetuning_utils import d4rl_normalize_return, prefixed
 from rlpd.agents import DualAdaptiveLearner
+from rlpd.agents import CQLLearner
 from rlpd.data.binary_datasets import BinaryDataset
 from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
