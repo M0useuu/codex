@@ -46,8 +46,8 @@ for env_name in "${envs[@]}"; do
     --pretrain_steps=1000000 \
     --batch_size=256 \
     --offline_utd_ratio=1 \
-    --log_interval=1000 \
-    --eval_interval=5000 \
+    --log_interval=10000 \
+    --eval_interval=50000 \
     --eval_episodes=10 \
     --offline_checkpoint_dir="${ckpt_dir}" &
 
