@@ -120,7 +120,8 @@ class BinaryDataset(Dataset):
 
         dones[-1] = True
 
-        dataset_dict["masks"] = 1.0 - dataset_dict["terminals"]
+        # IMPORTANT: keep bootstrapping mask consistent with computed trajectory boundaries.
+        dataset_dict["masks"] = 1.0 - dones.astype(np.float32)
         del dataset_dict["terminals"]
 
         for k, v in dataset_dict.items():

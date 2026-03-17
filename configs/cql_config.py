@@ -1,6 +1,5 @@
 from configs import sac_config
 
-
 def get_config():
     config = sac_config.get_config()
 

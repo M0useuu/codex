@@ -1,10 +1,8 @@
 #! /usr/bin/env python
 import os
-
 import d4rl
 import d4rl.gym_mujoco
 import d4rl.locomotion
-import dmcgym
 import gym
 import tqdm
 import wandb
@@ -79,7 +77,7 @@ def main(_):
     for i in tqdm.tqdm(range(FLAGS.pretrain_steps), smoothing=0.1, disable=not FLAGS.tqdm):
         offline_batch = ds.sample(FLAGS.batch_size * FLAGS.offline_utd_ratio)
         if "antmaze" in FLAGS.env_name:
-            offline_batch["rewards"] = offline_batch["rewards"] - 1
+            offline_batch["rewards"] = offline_batch["rewards"] * 10.0 - 5.0
 
         agent, update_info = agent.update(offline_batch, FLAGS.offline_utd_ratio)
 

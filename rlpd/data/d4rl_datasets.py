@@ -28,7 +28,9 @@ class D4RLDataset(Dataset):
 
         dones[-1] = True
 
-        dataset_dict["masks"] = 1.0 - dataset_dict["terminals"]
+        # IMPORTANT: use trajectory-boundary dones (terminal OR timeout/discontinuity)
+        # for bootstrapping masks, otherwise Q can incorrectly bootstrap across episode ends.
+        dataset_dict["masks"] = 1.0 - dones.astype(np.float32)
         del dataset_dict["terminals"]
 
         for k, v in dataset_dict.items():
