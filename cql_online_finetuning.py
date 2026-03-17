@@ -81,7 +81,7 @@ def main(_):
         os.makedirs(buffer_dir, exist_ok=True)
 
     env = gym.make(FLAGS.env_name)
-    env = wrap_gym(env, rescale_actions=True)
+    env = wrap_gym(env, rescale_actions=False)
     env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=1)
     env.seed(FLAGS.seed)
 
@@ -91,7 +91,7 @@ def main(_):
         ds = D4RLDataset(env)
 
     eval_env = gym.make(FLAGS.env_name)
-    eval_env = wrap_gym(eval_env, rescale_actions=True)
+    eval_env = wrap_gym(eval_env, rescale_actions=False)
     eval_env.seed(FLAGS.seed + 42)
 
     kwargs = dict(FLAGS.config)
@@ -152,7 +152,7 @@ def main(_):
             )
             batch = combine(offline_batch, online_batch)
             if "antmaze" in FLAGS.env_name:
-                batch["rewards"] -= 1
+                batch["rewards"] = batch["rewards"] * 10.0 - 5.0
 
             agent, update_info = agent.update(batch, FLAGS.online_utd_ratio)
 
