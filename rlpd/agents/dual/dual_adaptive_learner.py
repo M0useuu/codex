@@ -208,12 +208,34 @@ class DualAdaptiveLearner(Agent):
 
         return np.asarray(actions), self.replace(rng=rng)
 
+
+    @jax.jit
+    def _eval_actions_jit(self, obs: jnp.ndarray) -> jnp.ndarray:
+        dist1 = self.actor.apply_fn({"params": self.actor.params}, obs)
+        dist2 = self.actor2.apply_fn({"params": self.actor2.params}, obs)
+
+        a1 = dist1.mode()
+        a2 = dist2.mode()
+
+        q1 = self._q_for_action(obs, a1, self.critic)
+        q2 = self._q_for_action(obs, a2, self.critic2)
+        idx = jnp.argmax(jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature, axis=-1)
+        return jnp.where(idx[:, None] == 0, a1, a2)
+
     def sample_actions(self, observations: np.ndarray) -> Tuple[np.ndarray, Agent]:
         return self._select_action_by_q(observations, eval_mode=False)
 
     def eval_actions(self, observations: np.ndarray) -> np.ndarray:
-        actions, _ = self._select_action_by_q(observations, eval_mode=True)
-        return actions
+        obs = jnp.asarray(observations)
+        squeeze_back = False
+        if obs.ndim == 1:
+            obs = obs[None, :]
+            squeeze_back = True
+
+        actions = self._eval_actions_jit(obs)
+        if squeeze_back:
+            actions = actions[0]
+        return np.asarray(actions)
 
     def _compute_adaptive_targets(self, batch: DatasetDict, rng: jax.random.PRNGKey):
         next_obs = batch["next_observations"]
