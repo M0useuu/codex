@@ -5,6 +5,8 @@ def get_config():
 
     config.model_cls = "CQLLearner"
 
+    config.hidden_dims = (256, 256, 256)
+
     config.cql_n_actions = 10
     config.cql_importance_sample = True
     config.cql_temp = 1.0
