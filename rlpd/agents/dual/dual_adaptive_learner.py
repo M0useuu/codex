@@ -173,38 +173,26 @@ class DualAdaptiveLearner(Agent):
     def add_action(actions1: jnp.ndarray, actions2: jnp.ndarray) -> jnp.ndarray:
         return 0.5 * (actions1 + actions2)
 
-    def _select_action_by_q(
-        self, observations: np.ndarray, eval_mode: bool
-    ) -> Tuple[np.ndarray, Agent]:
-        obs = jnp.asarray(observations)
-        squeeze_back = False
-        if obs.ndim == 1:
-            obs = obs[None, :]
-            squeeze_back = True
-
+    @jax.jit
+    def _sample_actions_jit(
+        self, obs: jnp.ndarray, rng: jax.random.PRNGKey
+    ) -> Tuple[jnp.ndarray, jax.random.PRNGKey]:
         dist1 = self.actor.apply_fn({"params": self.actor.params}, obs)
         dist2 = self.actor2.apply_fn({"params": self.actor2.params}, obs)
 
-        rng = self.rng
-        if eval_mode:
-            a1 = dist1.mode()
-            a2 = dist2.mode()
-        else:
-            key1, rng = jax.random.split(rng)
-            key2, rng = jax.random.split(rng)
-            a1 = dist1.sample(seed=key1)
-            a2 = dist2.sample(seed=key2)
+        key1, rng = jax.random.split(rng)
+        key2, rng = jax.random.split(rng)
+        a1 = dist1.sample(seed=key1)
+        a2 = dist2.sample(seed=key2)
 
         q1 = self._q_for_action(obs, a1, self.critic)
         q2 = self._q_for_action(obs, a2, self.critic2)
-        idx = jnp.argmax(jnp.stack([q1, q2], axis=-1), axis=-1)
+        logits = jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature
 
-        idx = idx[:, None]
-        actions = jnp.where(idx == 0, a1, a2)
-        if squeeze_back:
-            actions = actions[0]
-
-        return np.asarray(actions), self.replace(rng=rng)
+        key, rng = jax.random.split(rng)
+        idx = jax.random.categorical(key, logits=logits, axis=-1)
+        actions = jnp.where(idx[:, None] == 0, a1, a2)
+        return actions, rng
 
 
     @jax.jit
@@ -221,7 +209,17 @@ class DualAdaptiveLearner(Agent):
         return jnp.where(idx[:, None] == 0, a1, a2)
 
     def sample_actions(self, observations: np.ndarray) -> Tuple[np.ndarray, Agent]:
-        return self._select_action_by_q(observations, eval_mode=False)
+        obs = jnp.asarray(observations)
+        squeeze_back = False
+        if obs.ndim == 1:
+            obs = obs[None, :]
+            squeeze_back = True
+
+        actions, rng = self._sample_actions_jit(obs, self.rng)
+        if squeeze_back:
+            actions = actions[0]
+
+        return np.asarray(actions), self.replace(rng=rng)
 
     def eval_actions(self, observations: np.ndarray) -> np.ndarray:
         obs = jnp.asarray(observations)
