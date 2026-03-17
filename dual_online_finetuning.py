@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 import os
 import pickle
+import time
 
 import d4rl
 import d4rl.gym_mujoco
@@ -42,6 +43,26 @@ flags.DEFINE_boolean(
     "checkpoint_buffer", False, "Save agent replay buffer on evaluation."
 )
 flags.DEFINE_integer("online_utd_ratio", 5, "Online update-to-data ratio.")
+flags.DEFINE_boolean(
+    "eval_at_step0",
+    False,
+    "Whether to run evaluation at step 0. Disabling avoids long startup stalls.",
+)
+flags.DEFINE_boolean(
+    "precompile_update",
+    False,
+    "Compile the jitted update function before online interaction. May take a long time on CPU.",
+)
+flags.DEFINE_integer(
+    "progress_interval",
+    1000,
+    "Write lightweight progress heartbeat every N steps.",
+)
+flags.DEFINE_string(
+    "wandb_mode",
+    "online",
+    "Weights & Biases mode: online/offline/disabled.",
+)
 flags.DEFINE_boolean(
     "binary_include_bc", True, "Whether to include BC data in the binary datasets."
 )
@@ -113,7 +134,7 @@ def main(_):
             f"got: {FLAGS.offline_checkpoint_dir}"
         )
 
-    wandb.init(project=FLAGS.project_name)
+    wandb.init(project=FLAGS.project_name, mode=FLAGS.wandb_mode)
     wandb.config.update(FLAGS)
 
     exp_prefix = f"s{FLAGS.seed}_dual_online"
@@ -149,6 +170,10 @@ def main(_):
 
     agent = _load_pretrained_dual_agent(agent, FLAGS.offline_checkpoint_dir)
 
+    if FLAGS.precompile_update:
+        compile_batch = ds.sample(int(FLAGS.batch_size * FLAGS.online_utd_ratio))
+        agent.update.lower(compile_batch, FLAGS.online_utd_ratio).compile()
+
     replay_buffer = ReplayBuffer(
         env.observation_space, env.action_space, FLAGS.max_steps
     )
@@ -156,6 +181,9 @@ def main(_):
 
     latest_episode_metrics = None
     observation, done = env.reset(), False
+    loop_start_time = time.time()
+    last_progress_time = loop_start_time
+    last_progress_step = 0
     for i in tqdm.tqdm(range(FLAGS.max_steps + 1), smoothing=0.1, disable=not FLAGS.tqdm):
         if i < FLAGS.start_training:
             action = env.action_space.sample()
@@ -204,7 +232,20 @@ def main(_):
                     train_metrics.update(prefixed(latest_episode_metrics, "training"))
                 wandb.log(train_metrics, step=i + FLAGS.pretrain_steps)
 
-        if i % FLAGS.eval_interval == 0:
+        if FLAGS.progress_interval > 0 and i > 0 and i % FLAGS.progress_interval == 0:
+            now = time.time()
+            dt = max(now - last_progress_time, 1e-6)
+            delta_steps = i - last_progress_step
+            sps = delta_steps / dt
+            phase = "warmup" if i < FLAGS.start_training else "training"
+            tqdm.tqdm.write(
+                f"[progress] step={i} phase={phase} sps={sps:.2f} elapsed={now - loop_start_time:.1f}s"
+            )
+            last_progress_time = now
+            last_progress_step = i
+
+        should_eval = i % FLAGS.eval_interval == 0 and (FLAGS.eval_at_step0 or i > 0)
+        if should_eval:
             eval_info = evaluate(
                 agent,
                 eval_env,
