@@ -21,6 +21,23 @@ from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
 from rlpd.wrappers import wrap_gym
 
+# DEBUG_NAN_GUARD_START
+import numpy as np
+
+
+def _check_finite(name, value, step):
+    """Temporary debug guard to locate NaN/Inf sources during rollout."""
+    arr = np.asarray(value)
+    if not np.all(np.isfinite(arr)):
+        raise FloatingPointError(
+            "[DEBUG_NAN_GUARD] Non-finite value detected: "
+            f"name={name}, step={step}, shape={arr.shape}, "
+            f"min={np.nanmin(arr)}, max={np.nanmax(arr)}"
+        )
+
+
+# DEBUG_NAN_GUARD_END
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("project_name", "rlpd", "wandb project name.")
@@ -70,6 +87,16 @@ flags.DEFINE_string(
     "offline_checkpoint_dir",
     None,
     "Absolute directory of offline CQL weights. Online finetuning loads agent1 and agent2 from this dir.",
+)
+flags.DEFINE_boolean(
+    "debug_nan_guard",
+    True,
+    "Temporary debug guard: checks observation/action/reward finite values to locate Mujoco NaNs.",
+)
+flags.DEFINE_integer(
+    "debug_nan_guard_log_interval",
+    1000,
+    "Temporary debug guard: print finite-range heartbeat every N steps (<=0 to disable).",
 )
 
 config_flags.DEFINE_config_file(
@@ -181,6 +208,10 @@ def main(_):
 
     latest_episode_metrics = None
     observation, done = env.reset(), False
+    if FLAGS.debug_nan_guard:
+        # DEBUG_NAN_GUARD
+        _check_finite("reset_observation", observation, step=0)
+
     loop_start_time = time.time()
     last_progress_time = loop_start_time
     last_progress_step = 0
@@ -190,7 +221,29 @@ def main(_):
         else:
             action, agent = agent.sample_actions(observation)
 
+        if FLAGS.debug_nan_guard:
+            # DEBUG_NAN_GUARD
+            _check_finite("observation_before_step", observation, step=i)
+            _check_finite("action_before_step", action, step=i)
+            if (
+                FLAGS.debug_nan_guard_log_interval > 0
+                and i > 0
+                and i % FLAGS.debug_nan_guard_log_interval == 0
+            ):
+                obs_arr = np.asarray(observation)
+                act_arr = np.asarray(action)
+                tqdm.tqdm.write(
+                    "[DEBUG_NAN_GUARD] "
+                    f"step={i} obs[min,max]=({np.min(obs_arr):.4e},{np.max(obs_arr):.4e}) "
+                    f"act[min,max]=({np.min(act_arr):.4e},{np.max(act_arr):.4e})"
+                )
+
         next_observation, reward, done, info = env.step(action)
+        if FLAGS.debug_nan_guard:
+            # DEBUG_NAN_GUARD
+            _check_finite("next_observation_after_step", next_observation, step=i)
+            _check_finite("reward_after_step", reward, step=i)
+
         mask = 1.0 if (not done or "TimeLimit.truncated" in info) else 0.0
 
         replay_buffer.insert(
