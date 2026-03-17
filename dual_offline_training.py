@@ -5,20 +5,18 @@ import d4rl
 import d4rl.gym_mujoco
 import d4rl.locomotion
 import gym
-import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
 from flax.training import checkpoints
 from ml_collections import config_flags
 
-from cql_finetuning_utils import d4rl_normalize_return, prefixed
-from rlpd.agents import DualAdaptiveLearner
 from rlpd.agents import CQLLearner
 from rlpd.data.binary_datasets import BinaryDataset
 from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
 from rlpd.wrappers import wrap_gym
+from utils import d4rl_normalize_return, masked_dataset, prefixed
 
 FLAGS = flags.FLAGS
 
@@ -34,9 +32,9 @@ flags.DEFINE_boolean("tqdm", True, "Use tqdm progress bar.")
 flags.DEFINE_boolean("save_video", False, "Save videos during evaluation.")
 flags.DEFINE_integer("offline_utd_ratio", 1, "Offline update-to-data ratio.")
 flags.DEFINE_float(
-    "offline_mask_ratio",
+    "offline_mask_prob",
     0.9,
-    "Mask ratio used by convert_d4rl_mask to split one offline batch into two datasets.",
+    "Mask probability used to initialize two masked offline datasets.",
 )
 flags.DEFINE_boolean(
     "binary_include_bc", True, "Whether to include BC data in the binary datasets."
@@ -44,74 +42,27 @@ flags.DEFINE_boolean(
 flags.DEFINE_string(
     "offline_checkpoint_dir",
     None,
-    "Absolute directory to save offline weights. Will save dual ckpt and per-agent ckpts.",
+    "Absolute directory to save offline weights. Saves agent1 and agent2 CQL checkpoints.",
 )
 
 config_flags.DEFINE_config_file(
     "config",
-    "configs/dual_adaptive_config.py",
-    "File path to the training hyperparameter configuration.",
+    "configs/cql_config.py",
+    "File path to the offline CQL hyperparameter configuration.",
     lock_config=False,
 )
 
 
-def _index_batch(batch, idx):
-    return {k: v[idx] for k, v in batch.items()}
-
-
-def _resample_to_size(batch, size, rng):
-    n = batch["observations"].shape[0]
-    if n == 0:
-        raise ValueError("Masked batch is empty. Adjust --offline_mask_ratio.")
-    if n == size:
-        return batch
-    replace = n < size
-    idx = rng.choice(n, size=size, replace=replace)
-    return _index_batch(batch, idx)
-
-
-def convert_d4rl_mask(batch, mask_ratio, target_size, rng):
-    """Split one offline batch into two masked datasets with resampling to equal size."""
-
-    n = batch["observations"].shape[0]
-    mask = rng.uniform(size=n) < mask_ratio
-    if mask.sum() == 0:
-        mask[rng.integers(0, n)] = True
-    if mask.sum() == n:
-        mask[rng.integers(0, n)] = False
-
-    batch_a = _index_batch(batch, np.where(mask)[0])
-    batch_b = _index_batch(batch, np.where(~mask)[0])
-
-    batch_a = _resample_to_size(batch_a, target_size, rng)
-    batch_b = _resample_to_size(batch_b, target_size, rng)
-    return batch_a, batch_b
-
-
-def _save_two_agent_checkpoints(agent, checkpoint_dir, step):
-    agent1_state = {
+def _save_single_agent_checkpoint(agent, checkpoint_dir, step):
+    payload = {
         "actor": agent.actor,
         "critic": agent.critic,
         "target_critic": agent.target_critic,
         "temp": agent.temp,
     }
-    agent2_state = {
-        "actor": agent.actor2,
-        "critic": agent.critic2,
-        "target_critic": agent.target_critic2,
-        "temp": agent.temp2,
-    }
-
     checkpoints.save_checkpoint(
-        os.path.join(checkpoint_dir, "agent1"),
-        agent1_state,
-        step=step,
-        overwrite=True,
-        keep=20,
-    )
-    checkpoints.save_checkpoint(
-        os.path.join(checkpoint_dir, "agent2"),
-        agent2_state,
+        checkpoint_dir,
+        payload,
         step=step,
         overwrite=True,
         keep=20,
@@ -126,10 +77,6 @@ def main(_):
             "--offline_checkpoint_dir must be an absolute path, "
             f"got: {FLAGS.offline_checkpoint_dir}"
         )
-    if not 0.0 < FLAGS.offline_mask_ratio < 1.0:
-        raise ValueError("--offline_mask_ratio must be in (0, 1).")
-
-    rng = np.random.default_rng(FLAGS.seed)
 
     wandb.init(project=FLAGS.project_name)
     wandb.config.update(FLAGS)
@@ -139,9 +86,12 @@ def main(_):
     env.seed(FLAGS.seed)
 
     if "binary" in FLAGS.env_name:
-        ds = BinaryDataset(env, include_bc_data=FLAGS.binary_include_bc)
+        raw_ds = BinaryDataset(env, include_bc_data=FLAGS.binary_include_bc)
     else:
-        ds = D4RLDataset(env)
+        raw_ds = D4RLDataset(env)
+
+    ds_agent1 = masked_dataset(raw_ds, FLAGS.offline_mask_prob, FLAGS.seed)
+    ds_agent2 = masked_dataset(raw_ds, FLAGS.offline_mask_prob, FLAGS.seed + 1)
 
     eval_env = gym.make(FLAGS.env_name)
     eval_env = wrap_gym(eval_env, rescale_actions=False)
@@ -149,52 +99,64 @@ def main(_):
 
     kwargs = dict(FLAGS.config)
     model_cls = kwargs.pop("model_cls")
-    agent = globals()[model_cls].create(
+    if model_cls != "CQLLearner":
+        raise ValueError(f"dual_offline_training requires CQLLearner config, got: {model_cls}")
+
+    agent1 = globals()[model_cls].create(
         FLAGS.seed, env.observation_space, env.action_space, **kwargs
     )
-
-    per_agent_size = FLAGS.batch_size * FLAGS.offline_utd_ratio
+    agent2 = globals()[model_cls].create(
+        FLAGS.seed + 1, env.observation_space, env.action_space, **kwargs
+    )
 
     for i in tqdm.tqdm(range(FLAGS.pretrain_steps), smoothing=0.1, disable=not FLAGS.tqdm):
-        sampled = ds.sample(2 * per_agent_size)
+        offline_batch_1 = ds_agent1.sample(FLAGS.batch_size * FLAGS.offline_utd_ratio)
+        offline_batch_2 = ds_agent2.sample(FLAGS.batch_size * FLAGS.offline_utd_ratio)
         if "antmaze" in FLAGS.env_name:
-            sampled["rewards"] = sampled["rewards"] * 10.0 - 5.0
+            offline_batch_1["rewards"] = offline_batch_1["rewards"] * 10.0 - 5.0
+            offline_batch_2["rewards"] = offline_batch_2["rewards"] * 10.0 - 5.0
 
-        offline_batch_0, offline_batch_1 = convert_d4rl_mask(
-            sampled,
-            FLAGS.offline_mask_ratio,
-            per_agent_size,
-            rng,
-        )
-
-        agent, update_info = agent.update_offline(
-            offline_batch_0, offline_batch_1, FLAGS.offline_utd_ratio
-        )
+        agent1, update_info_1 = agent1.update(offline_batch_1, FLAGS.offline_utd_ratio)
+        agent2, update_info_2 = agent2.update(offline_batch_2, FLAGS.offline_utd_ratio)
 
         if i % FLAGS.log_interval == 0:
-            update_info["offline_mask_ratio"] = FLAGS.offline_mask_ratio
-            wandb.log(prefixed(update_info, "offline-training"), step=i)
+            metrics = {
+                **prefixed(update_info_1, "offline-training/agent1"),
+                **prefixed(update_info_2, "offline-training/agent2"),
+                "offline-training/offline_mask_prob": FLAGS.offline_mask_prob,
+            }
+            wandb.log(metrics, step=i)
 
         if i % FLAGS.eval_interval == 0:
-            eval_info = evaluate(
-                agent,
+            eval_info_1 = evaluate(
+                agent1,
                 eval_env,
                 num_episodes=FLAGS.eval_episodes,
                 save_video=FLAGS.save_video,
             )
-            eval_info["return"] = d4rl_normalize_return(eval_env, eval_info["return"])
-            wandb.log(prefixed(eval_info, "offline-evaluation"), step=i)
+            eval_info_2 = evaluate(
+                agent2,
+                eval_env,
+                num_episodes=FLAGS.eval_episodes,
+                save_video=FLAGS.save_video,
+            )
+            eval_info_1["return"] = d4rl_normalize_return(eval_env, eval_info_1["return"])
+            eval_info_2["return"] = d4rl_normalize_return(eval_env, eval_info_2["return"])
+            wandb.log(
+                {
+                    **prefixed(eval_info_1, "offline-evaluation/agent1"),
+                    **prefixed(eval_info_2, "offline-evaluation/agent2"),
+                },
+                step=i,
+            )
 
-    os.makedirs(FLAGS.offline_checkpoint_dir, exist_ok=True)
+    agent1_dir = os.path.join(FLAGS.offline_checkpoint_dir, "agent1")
+    agent2_dir = os.path.join(FLAGS.offline_checkpoint_dir, "agent2")
+    os.makedirs(agent1_dir, exist_ok=True)
+    os.makedirs(agent2_dir, exist_ok=True)
 
-    checkpoints.save_checkpoint(
-        os.path.join(FLAGS.offline_checkpoint_dir, "dual"),
-        agent,
-        step=FLAGS.pretrain_steps,
-        overwrite=True,
-        keep=20,
-    )
-    _save_two_agent_checkpoints(agent, FLAGS.offline_checkpoint_dir, FLAGS.pretrain_steps)
+    _save_single_agent_checkpoint(agent1, agent1_dir, FLAGS.pretrain_steps)
+    _save_single_agent_checkpoint(agent2, agent2_dir, FLAGS.pretrain_steps)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from absl import app, flags
 from flax.training import checkpoints
 from ml_collections import config_flags
 
-from cql_finetuning_utils import combine, d4rl_normalize_return, prefixed
+from utils import combine, d4rl_normalize_return, prefixed
 from rlpd.agents import DualAdaptiveLearner
 from rlpd.data import ReplayBuffer
 from rlpd.data.binary_datasets import BinaryDataset
@@ -48,7 +48,7 @@ flags.DEFINE_boolean(
 flags.DEFINE_string(
     "offline_checkpoint_dir",
     None,
-    "Absolute directory of offline weights. Online finetuning loads dual/ or agent1+agent2 from this dir.",
+    "Absolute directory of offline CQL weights. Online finetuning loads agent1 and agent2 from this dir.",
 )
 
 config_flags.DEFINE_config_file(
@@ -60,20 +60,16 @@ config_flags.DEFINE_config_file(
 
 
 def _load_pretrained_dual_agent(agent, checkpoint_dir):
-    dual_dir = os.path.join(checkpoint_dir, "dual")
     agent1_dir = os.path.join(checkpoint_dir, "agent1")
     agent2_dir = os.path.join(checkpoint_dir, "agent2")
-
-    if checkpoints.latest_checkpoint(dual_dir) is not None:
-        return checkpoints.restore_checkpoint(dual_dir, target=agent)
 
     if (
         checkpoints.latest_checkpoint(agent1_dir) is None
         or checkpoints.latest_checkpoint(agent2_dir) is None
     ):
         raise FileNotFoundError(
-            "No checkpoint found. Expected either '<offline_checkpoint_dir>/dual' "
-            "or both '<offline_checkpoint_dir>/agent1' and '<offline_checkpoint_dir>/agent2'."
+            "No checkpoint found. Expected both "
+            "'<offline_checkpoint_dir>/agent1' and '<offline_checkpoint_dir>/agent2'."
         )
 
     agent1_state = checkpoints.restore_checkpoint(
