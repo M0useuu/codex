@@ -205,8 +205,7 @@ class DualAdaptiveLearner(Agent):
 
         def _on_non_finite(_):
             jax.debug.print(
-                "[DualAdaptiveLearner][NaNAlert] {name}: nan_ratio={nan_ratio}, inf_ratio={inf_ratio}, min={vmin}, max={vmax}",
-                name=name,
+                f"[DualAdaptiveLearner][NaNAlert] {name}: nan_ratio={{nan_ratio}}, inf_ratio={{inf_ratio}}, min={{vmin}}, max={{vmax}}",
                 nan_ratio=jnp.mean(jnp.isnan(value).astype(jnp.float32)),
                 inf_ratio=jnp.mean(jnp.isinf(value).astype(jnp.float32)),
                 vmin=jnp.nanmin(value),
