@@ -6,9 +6,9 @@ def get_config():
 
     config.model_cls = "DualAdaptiveLearner"
     config.hidden_dims = (256, 256, 256)
-
-    config.target_minmax_weight = 0.75
-    config.backup_entropy = True
+    
     config.action_selection_temperature = 1.0
+    config.ensemble_ratio = 0.5
+    config.actor_bc_coef = 0.5
 
     return config

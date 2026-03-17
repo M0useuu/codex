@@ -1,4 +1,4 @@
-"""Dual-agent adaptive learner with shared min-max target backup."""
+"""Dual-agent adaptive learner with uncertainty-aware target mixing."""
 
 from functools import partial
 from typing import Dict, Optional, Sequence, Tuple
@@ -33,8 +33,9 @@ class DualAdaptiveLearner(Agent):
     num_qs: int = struct.field(pytree_node=False)
     num_min_qs: Optional[int] = struct.field(pytree_node=False)
     backup_entropy: bool = struct.field(pytree_node=False)
-    target_minmax_weight: float = struct.field(pytree_node=False)
     action_selection_temperature: float = struct.field(pytree_node=False)
+    ensemble_ratio: float = struct.field(pytree_node=False)
+    actor_bc_coef: float = struct.field(pytree_node=False)
 
     @classmethod
     def create(
@@ -58,8 +59,9 @@ class DualAdaptiveLearner(Agent):
         backup_entropy: bool = True,
         use_pnorm: bool = False,
         use_critic_resnet: bool = False,
-        target_minmax_weight: float = 0.75,
         action_selection_temperature: float = 1.0,
+        ensemble_ratio: float = 0.5,
+        actor_bc_coef: float = 0.5,
     ):
         action_dim = action_space.shape[-1]
         observations = observation_space.sample()
@@ -78,17 +80,14 @@ class DualAdaptiveLearner(Agent):
         )
         actor_def = TanhNormal(actor_base_cls, action_dim)
 
-        actor_params1 = actor_def.init(actor_key1, observations)["params"]
-        actor_params2 = actor_def.init(actor_key2, observations)["params"]
-
         actor1 = TrainState.create(
             apply_fn=actor_def.apply,
-            params=actor_params1,
+            params=actor_def.init(actor_key1, observations)["params"],
             tx=optax.adam(learning_rate=actor_lr),
         )
         actor2 = TrainState.create(
             apply_fn=actor_def.apply,
-            params=actor_params2,
+            params=actor_def.init(actor_key2, observations)["params"],
             tx=optax.adam(learning_rate=actor_lr),
         )
 
@@ -134,16 +133,14 @@ class DualAdaptiveLearner(Agent):
         )
 
         temp_def = Temperature(init_temperature)
-        temp_params1 = temp_def.init(temp_key1)["params"]
-        temp_params2 = temp_def.init(temp_key2)["params"]
         temp1 = TrainState.create(
             apply_fn=temp_def.apply,
-            params=temp_params1,
+            params=temp_def.init(temp_key1)["params"],
             tx=optax.adam(learning_rate=temp_lr),
         )
         temp2 = TrainState.create(
             apply_fn=temp_def.apply,
-            params=temp_params2,
+            params=temp_def.init(temp_key2)["params"],
             tx=optax.adam(learning_rate=temp_lr),
         )
 
@@ -163,26 +160,10 @@ class DualAdaptiveLearner(Agent):
             num_qs=num_qs,
             num_min_qs=num_min_qs,
             backup_entropy=backup_entropy,
-            target_minmax_weight=target_minmax_weight,
             action_selection_temperature=action_selection_temperature,
+            ensemble_ratio=ensemble_ratio,
+            actor_bc_coef=actor_bc_coef,
         )
-
-    def _sample_action_candidates(
-        self, observations: jnp.ndarray, eval_mode: bool, rng: jax.random.PRNGKey
-    ):
-        dist1 = self.actor.apply_fn({"params": self.actor.params}, observations)
-        dist2 = self.actor2.apply_fn({"params": self.actor2.params}, observations)
-
-        if eval_mode:
-            a1 = dist1.mode()
-            a2 = dist2.mode()
-        else:
-            key1, rng = jax.random.split(rng)
-            key2, rng = jax.random.split(rng)
-            a1 = dist1.sample(seed=key1)
-            a2 = dist2.sample(seed=key2)
-
-        return a1, a2, rng
 
     def _q_for_action(self, observations: jnp.ndarray, actions: jnp.ndarray, critic: TrainState):
         qs = critic.apply_fn({"params": critic.params}, observations, actions, False)
@@ -197,7 +178,19 @@ class DualAdaptiveLearner(Agent):
             obs = obs[None, :]
             squeeze_back = True
 
-        a1, a2, rng = self._sample_action_candidates(obs, eval_mode, self.rng)
+        dist1 = self.actor.apply_fn({"params": self.actor.params}, obs)
+        dist2 = self.actor2.apply_fn({"params": self.actor2.params}, obs)
+
+        rng = self.rng
+        if eval_mode:
+            a1 = dist1.mode()
+            a2 = dist2.mode()
+        else:
+            key1, rng = jax.random.split(rng)
+            key2, rng = jax.random.split(rng)
+            a1 = dist1.sample(seed=key1)
+            a2 = dist2.sample(seed=key2)
+
         q1 = self._q_for_action(obs, a1, self.critic)
         q2 = self._q_for_action(obs, a2, self.critic2)
         logits = jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature
@@ -210,7 +203,6 @@ class DualAdaptiveLearner(Agent):
 
         idx = idx[:, None]
         actions = jnp.where(idx == 0, a1, a2)
-
         if squeeze_back:
             actions = actions[0]
 
@@ -223,7 +215,7 @@ class DualAdaptiveLearner(Agent):
         actions, _ = self._select_action_by_q(observations, eval_mode=True)
         return actions
 
-    def _next_target_q(self, batch: DatasetDict, rng: jax.random.PRNGKey):
+    def _compute_adaptive_targets(self, batch: DatasetDict, rng: jax.random.PRNGKey):
         next_obs = batch["next_observations"]
         dist1 = self.actor.apply_fn({"params": self.actor.params}, next_obs)
         dist2 = self.actor2.apply_fn({"params": self.actor2.params}, next_obs)
@@ -243,7 +235,7 @@ class DualAdaptiveLearner(Agent):
         )
 
         key, rng = jax.random.split(rng)
-        next_qs1 = self.target_critic.apply_fn(
+        q1_ens = self.target_critic.apply_fn(
             {"params": target_params1},
             next_obs,
             next_actions1,
@@ -251,7 +243,7 @@ class DualAdaptiveLearner(Agent):
             rngs={"dropout": key},
         )
         key, rng = jax.random.split(rng)
-        next_qs2 = self.target_critic2.apply_fn(
+        q2_ens = self.target_critic2.apply_fn(
             {"params": target_params2},
             next_obs,
             next_actions2,
@@ -259,31 +251,48 @@ class DualAdaptiveLearner(Agent):
             rngs={"dropout": key},
         )
 
-        next_q1 = next_qs1.min(axis=0)
-        next_q2 = next_qs2.min(axis=0)
+        q1_min = q1_ens.min(axis=0)
+        q2_min = q2_ens.min(axis=0)
 
-        min_q = jnp.minimum(next_q1, next_q2)
-        max_q = jnp.maximum(next_q1, next_q2)
-        mixed_next_q = (
-            self.target_minmax_weight * min_q + (1.0 - self.target_minmax_weight) * max_q
-        )
+        if q1_ens.shape[0] >= 2:
+            unc1 = jnp.abs(q1_ens[0] - q1_ens[1])
+            unc2 = jnp.abs(q2_ens[0] - q2_ens[1])
+        else:
+            unc1 = jnp.zeros_like(q1_min)
+            unc2 = jnp.zeros_like(q2_min)
+        unc = 0.5 * (unc1 + unc2)
+
+        eps = 1e-6
+        gap1 = jax.nn.relu(q2_min - q1_min)
+        ratio1 = self.ensemble_ratio * gap1 / (gap1 + unc + eps)
+        mixed1 = q1_min + ratio1 * gap1
+
+        gap2 = jax.nn.relu(q1_min - q2_min)
+        ratio2 = self.ensemble_ratio * gap2 / (gap2 + unc + eps)
+        mixed2 = q2_min + ratio2 * gap2
 
         if self.backup_entropy:
             temp1 = self.temp.apply_fn({"params": self.temp.params})
             temp2 = self.temp2.apply_fn({"params": self.temp2.params})
-            entropy_penalty = 0.5 * (
-                temp1 * dist1.log_prob(next_actions1) + temp2 * dist2.log_prob(next_actions2)
-            )
-            mixed_next_q = mixed_next_q - entropy_penalty
+            mixed1 = mixed1 - temp1 * dist1.log_prob(next_actions1)
+            mixed2 = mixed2 - temp2 * dist2.log_prob(next_actions2)
 
-        target_q = batch["rewards"] + self.discount * batch["masks"] * mixed_next_q
-        return target_q, next_q1, next_q2, rng
+        target1 = batch["rewards"] + self.discount * batch["masks"] * mixed1
+        target2 = batch["rewards"] + self.discount * batch["masks"] * mixed2
 
-    def _update_critic_with_batch(
-        self, batch1: DatasetDict, batch2: DatasetDict
-    ) -> Tuple[Agent, Dict[str, float]]:
-        target_q1, next_q1_a, next_q1_b, rng = self._next_target_q(batch1, self.rng)
-        target_q2, next_q2_a, next_q2_b, rng = self._next_target_q(batch2, rng)
+        stats = {
+            "uncertainty": unc.mean(),
+            "gap1": gap1.mean(),
+            "gap2": gap2.mean(),
+            "ratio1": ratio1.mean(),
+            "ratio2": ratio2.mean(),
+            "target_q1": mixed1.mean(),
+            "target_q2": mixed2.mean(),
+        }
+        return target1, target2, stats, rng
+
+    def _update_critic(self, batch: DatasetDict):
+        target1, target2, target_stats, rng = self._compute_adaptive_targets(batch, self.rng)
 
         key1, rng = jax.random.split(rng)
         key2, rng = jax.random.split(rng)
@@ -291,23 +300,23 @@ class DualAdaptiveLearner(Agent):
         def critic1_loss_fn(critic_params):
             qs = self.critic.apply_fn(
                 {"params": critic_params},
-                batch1["observations"],
-                batch1["actions"],
+                batch["observations"],
+                batch["actions"],
                 True,
                 rngs={"dropout": key1},
             )
-            loss = ((qs - target_q1) ** 2).mean()
+            loss = ((qs - target1) ** 2).mean()
             return loss, {"critic1_loss": loss, "critic1_q": qs.mean()}
 
         def critic2_loss_fn(critic_params):
             qs = self.critic2.apply_fn(
                 {"params": critic_params},
-                batch2["observations"],
-                batch2["actions"],
+                batch["observations"],
+                batch["actions"],
                 True,
                 rngs={"dropout": key2},
             )
-            loss = ((qs - target_q2) ** 2).mean()
+            loss = ((qs - target2) ** 2).mean()
             return loss, {"critic2_loss": loss, "critic2_q": qs.mean()}
 
         grads1, info1 = jax.grad(critic1_loss_fn, has_aux=True)(self.critic.params)
@@ -323,97 +332,98 @@ class DualAdaptiveLearner(Agent):
             critic2.params, self.target_critic2.params, self.tau
         )
 
-        target_critic1 = self.target_critic.replace(params=target_critic1_params)
-        target_critic2 = self.target_critic2.replace(params=target_critic2_params)
-
-        info = {
-            **info1,
-            **info2,
-            "target_q1": target_q1.mean(),
-            "target_q2": target_q2.mean(),
-            "target_q1_agent1": next_q1_a.mean(),
-            "target_q1_agent2": next_q1_b.mean(),
-            "target_q2_agent1": next_q2_a.mean(),
-            "target_q2_agent2": next_q2_b.mean(),
-        }
-
-        return (
-            self.replace(
-                critic=critic1,
-                critic2=critic2,
-                target_critic=target_critic1,
-                target_critic2=target_critic2,
-                rng=rng,
-            ),
-            info,
+        new_agent = self.replace(
+            critic=critic1,
+            critic2=critic2,
+            target_critic=self.target_critic.replace(params=target_critic1_params),
+            target_critic2=self.target_critic2.replace(params=target_critic2_params),
+            rng=rng,
         )
+        return new_agent, {**info1, **info2, **target_stats}
 
-    def _update_actor_with_batch(
-        self, batch1: DatasetDict, batch2: DatasetDict
-    ) -> Tuple[Agent, Dict[str, float]]:
+    def _update_actor(self, batch: DatasetDict):
         key1, rng = jax.random.split(self.rng)
         key2, rng = jax.random.split(rng)
         key3, rng = jax.random.split(rng)
         key4, rng = jax.random.split(rng)
 
         def actor1_loss_fn(actor_params):
-            dist = self.actor.apply_fn({"params": actor_params}, batch1["observations"])
+            dist = self.actor.apply_fn({"params": actor_params}, batch["observations"])
             actions = dist.sample(seed=key1)
             log_probs = dist.log_prob(actions)
-            qs = self.critic.apply_fn(
+            q = self.critic.apply_fn(
                 {"params": self.critic.params},
-                batch1["observations"],
+                batch["observations"],
                 actions,
                 True,
                 rngs={"dropout": key2},
-            )
-            q = qs.mean(axis=0)
-            temperature = self.temp.apply_fn({"params": self.temp.params})
-            actor_loss = (log_probs * temperature - q).mean()
-            return actor_loss, {"actor1_loss": actor_loss, "entropy1": -log_probs.mean()}
+            ).mean(axis=0)
+            temp = self.temp.apply_fn({"params": self.temp.params})
+            sac_loss = (log_probs * temp - q).mean()
+            bc_loss = -dist.log_prob(batch["actions"]).mean()
+            actor_loss = sac_loss + self.actor_bc_coef * bc_loss
+            return actor_loss, {
+                "actor1_loss": actor_loss,
+                "actor1_sac_loss": sac_loss,
+                "actor1_bc_loss": bc_loss,
+                "entropy1": -log_probs.mean(),
+            }
 
         def actor2_loss_fn(actor_params):
-            dist = self.actor2.apply_fn({"params": actor_params}, batch2["observations"])
+            dist = self.actor2.apply_fn({"params": actor_params}, batch["observations"])
             actions = dist.sample(seed=key3)
             log_probs = dist.log_prob(actions)
-            qs = self.critic2.apply_fn(
+            q = self.critic2.apply_fn(
                 {"params": self.critic2.params},
-                batch2["observations"],
+                batch["observations"],
                 actions,
                 True,
                 rngs={"dropout": key4},
-            )
-            q = qs.mean(axis=0)
-            temperature = self.temp2.apply_fn({"params": self.temp2.params})
-            actor_loss = (log_probs * temperature - q).mean()
-            return actor_loss, {"actor2_loss": actor_loss, "entropy2": -log_probs.mean()}
+            ).mean(axis=0)
+            temp = self.temp2.apply_fn({"params": self.temp2.params})
+            sac_loss = (log_probs * temp - q).mean()
+            bc_loss = -dist.log_prob(batch["actions"]).mean()
+            actor_loss = sac_loss + self.actor_bc_coef * bc_loss
+            return actor_loss, {
+                "actor2_loss": actor_loss,
+                "actor2_sac_loss": sac_loss,
+                "actor2_bc_loss": bc_loss,
+                "entropy2": -log_probs.mean(),
+            }
 
         grads1, info1 = jax.grad(actor1_loss_fn, has_aux=True)(self.actor.params)
         grads2, info2 = jax.grad(actor2_loss_fn, has_aux=True)(self.actor2.params)
 
-        actor1 = self.actor.apply_gradients(grads=grads1)
-        actor2 = self.actor2.apply_gradients(grads=grads2)
-
-        return self.replace(actor=actor1, actor2=actor2, rng=rng), {**info1, **info2}
+        return (
+            self.replace(
+                actor=self.actor.apply_gradients(grads=grads1),
+                actor2=self.actor2.apply_gradients(grads=grads2),
+                rng=rng,
+            ),
+            {**info1, **info2},
+        )
 
     def _update_temperature(self, entropy1: float, entropy2: float):
-        def temp_loss_fn(temp_params, entropy):
-            temperature = self.temp.apply_fn({"params": temp_params})
-            loss = temperature * (entropy - self.target_entropy).mean()
-            return loss, {"temperature": temperature, "temperature_loss": loss}
+        def t1_loss_fn(temp_params):
+            t = self.temp.apply_fn({"params": temp_params})
+            loss = t * (entropy1 - self.target_entropy).mean()
+            return loss, {"temperature": t, "temperature_loss": loss}
 
-        grads1, info1 = jax.grad(temp_loss_fn, has_aux=True)(self.temp.params, entropy1)
-        temp1 = self.temp.apply_gradients(grads=grads1)
+        def t2_loss_fn(temp_params):
+            t = self.temp2.apply_fn({"params": temp_params})
+            loss = t * (entropy2 - self.target_entropy).mean()
+            return loss, {"temperature2": t, "temperature2_loss": loss}
 
-        def temp2_loss_fn(temp_params, entropy):
-            temperature = self.temp2.apply_fn({"params": temp_params})
-            loss = temperature * (entropy - self.target_entropy).mean()
-            return loss, {"temperature2": temperature, "temperature2_loss": loss}
+        g1, i1 = jax.grad(t1_loss_fn, has_aux=True)(self.temp.params)
+        g2, i2 = jax.grad(t2_loss_fn, has_aux=True)(self.temp2.params)
 
-        grads2, info2 = jax.grad(temp2_loss_fn, has_aux=True)(self.temp2.params, entropy2)
-        temp2 = self.temp2.apply_gradients(grads=grads2)
-
-        return self.replace(temp=temp1, temp2=temp2), {**info1, **info2}
+        return (
+            self.replace(
+                temp=self.temp.apply_gradients(grads=g1),
+                temp2=self.temp2.apply_gradients(grads=g2),
+            ),
+            {**i1, **i2},
+        )
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
@@ -422,13 +432,13 @@ class DualAdaptiveLearner(Agent):
 
             def slice_fn(x):
                 assert x.shape[0] % utd_ratio == 0
-                batch_size = x.shape[0] // utd_ratio
-                return x[batch_size * i : batch_size * (i + 1)]
+                bs = x.shape[0] // utd_ratio
+                return x[bs * i : bs * (i + 1)]
 
             mini_batch = jax.tree_util.tree_map(slice_fn, batch)
-            new_agent, critic_info = new_agent._update_critic_with_batch(mini_batch, mini_batch)
+            new_agent, critic_info = new_agent._update_critic(mini_batch)
 
-        new_agent, actor_info = new_agent._update_actor_with_batch(mini_batch, mini_batch)
+        new_agent, actor_info = new_agent._update_actor(mini_batch)
         new_agent, temp_info = new_agent._update_temperature(
             actor_info["entropy1"], actor_info["entropy2"]
         )
@@ -437,25 +447,8 @@ class DualAdaptiveLearner(Agent):
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update_offline(self, batch1: DatasetDict, batch2: DatasetDict, utd_ratio: int):
-        """Offline update for two dataset views (masked split)."""
-
-        new_agent = self
-        for i in range(utd_ratio):
-
-            def slice_fn(x):
-                assert x.shape[0] % utd_ratio == 0
-                mini_size = x.shape[0] // utd_ratio
-                return x[mini_size * i : mini_size * (i + 1)]
-
-            mini_batch1 = jax.tree_util.tree_map(slice_fn, batch1)
-            mini_batch2 = jax.tree_util.tree_map(slice_fn, batch2)
-            new_agent, critic_info = new_agent._update_critic_with_batch(
-                mini_batch1, mini_batch2
-            )
-
-        new_agent, actor_info = new_agent._update_actor_with_batch(mini_batch1, mini_batch2)
-        new_agent, temp_info = new_agent._update_temperature(
-            actor_info["entropy1"], actor_info["entropy2"]
-        )
-
-        return new_agent, {**critic_info, **actor_info, **temp_info}
+        # Kept for API compatibility; online path uses update().
+        merged_batch = {}
+        for k in batch1.keys():
+            merged_batch[k] = jnp.concatenate([batch1[k], batch2[k]], axis=0)
+        return self.update(merged_batch, utd_ratio)

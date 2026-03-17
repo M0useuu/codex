@@ -33,6 +33,8 @@ EVAL_INTERVAL=50
 
 # 避免 XLA 预分配占满显存
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# 避免 JAX 探测 rocm/tpu 后打印误导性日志（仅用于 smoke 测试）
+export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
 
 echo "[1/2] Running dual offline pretraining..."
 python dual_offline_training.py \
