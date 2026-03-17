@@ -13,7 +13,7 @@ def get_config():
     config.init_temperature = 1.0
     config.target_entropy = config_dict.placeholder(float)
 
-    config.backup_entropy = True
+    config.backup_entropy = False
     config.critic_weight_decay = config_dict.placeholder(float)
 
     return config
