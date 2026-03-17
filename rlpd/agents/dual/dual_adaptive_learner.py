@@ -205,7 +205,7 @@ class DualAdaptiveLearner(Agent):
 
         q1 = self._q_for_action(obs, a1, self.critic)
         q2 = self._q_for_action(obs, a2, self.critic2)
-        idx = jnp.argmax(jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature, axis=-1)
+        idx = jnp.argmax(jnp.stack([q1, q2], axis=-1), axis=-1)
         return jnp.where(idx[:, None] == 0, a1, a2)
 
     def sample_actions(self, observations: np.ndarray) -> Tuple[np.ndarray, Agent]:
