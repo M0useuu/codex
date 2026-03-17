@@ -278,8 +278,8 @@ class DualAdaptiveLearner(Agent):
         q11_next = q2_ens[0]
         q12_next = q2_ens[1] if q2_ens.shape[0] > 1 else q2_ens[0]
 
-        q0_next = jnp.minimum(q01_next, q02_next)
-        q1_next = jnp.minimum(q11_next, q12_next)
+        q0_next = q1_ens.min(axis=0)
+        q1_next = q2_ens.min(axis=0)
         unc = 0.5 * (jnp.abs(q01_next - q02_next) + jnp.abs(q11_next - q12_next))
 
         eps = 1e-6
@@ -332,8 +332,8 @@ class DualAdaptiveLearner(Agent):
                 True,
                 rngs={"dropout": key2},
             )
-            loss0 = ((qs0[0] - target0) ** 2).mean() + ((qs0[1] - target0) ** 2).mean()
-            loss1 = ((qs1[0] - target1) ** 2).mean() + ((qs1[1] - target1) ** 2).mean()
+            loss0 = ((qs0 - target0) ** 2).mean()
+            loss1 = ((qs1 - target1) ** 2).mean()
             total = loss0 + loss1
             info = {
                 "critic1_loss": loss0,
@@ -435,15 +435,13 @@ class DualAdaptiveLearner(Agent):
 
     def _update_temperature(self, log_pi1: float, log_pi2: float):
         def t1_loss_fn(temp_params):
-            log_temp = temp_params["log_temp"]
-            loss = -(log_temp * jax.lax.stop_gradient(log_pi1 + self.target_entropy)).mean()
-            temperature = self.alpha_multiplier * jnp.exp(log_temp)
+            temperature = self.alpha_multiplier * self.temp.apply_fn({"params": temp_params})
+            loss = temperature * (-log_pi1 - self.target_entropy).mean()
             return loss, {"temperature": temperature, "temperature_loss": loss}
 
         def t2_loss_fn(temp_params):
-            log_temp = temp_params["log_temp"]
-            loss = -(log_temp * jax.lax.stop_gradient(log_pi2 + self.target_entropy)).mean()
-            temperature = self.alpha_multiplier * jnp.exp(log_temp)
+            temperature = self.alpha_multiplier * self.temp2.apply_fn({"params": temp_params})
+            loss = temperature * (-log_pi2 - self.target_entropy).mean()
             return loss, {"temperature2": temperature, "temperature2_loss": loss}
 
         g1, i1 = jax.grad(t1_loss_fn, has_aux=True)(self.temp.params)
@@ -459,24 +457,16 @@ class DualAdaptiveLearner(Agent):
 
     @partial(jax.jit, static_argnames="utd_ratio")
     def update(self, batch: DatasetDict, utd_ratio: int):
-        bs = batch["observations"].shape[0] // utd_ratio
+        new_agent = self
+        for i in range(utd_ratio):
 
-        def make_mini_batch(i):
-            return jax.tree_util.tree_map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, i * bs, bs, axis=0),
-                batch,
-            )
+            def slice_batch(x):
+                assert x.shape[0] % utd_ratio == 0
+                batch_size = x.shape[0] // utd_ratio
+                return x[batch_size * i : batch_size * (i + 1)]
 
-        def critic_scan_fn(carry, i):
-            agent = carry
-            mini_batch = make_mini_batch(i)
-            agent, critic_info = agent._update_critic(mini_batch)
-            return agent, critic_info
-
-        new_agent, critic_infos = jax.lax.scan(critic_scan_fn, self, jnp.arange(utd_ratio))
-        critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
-
-        mini_batch = make_mini_batch(utd_ratio - 1)
+            mini_batch = jax.tree_util.tree_map(slice_batch, batch)
+            new_agent, critic_info = new_agent._update_critic(mini_batch)
 
         new_agent, actor_info = new_agent._update_actor(mini_batch)
         new_agent, temp_info = new_agent._update_temperature(
