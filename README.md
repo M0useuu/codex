@@ -96,3 +96,13 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false python train_finetuning_pixels.py --env_name
                 --config=configs/rlpd_pixels_config.py \
                 --project_name=rlpd_vd4rl
 ```
+
+## CQL offline training: why can Q-values be negative?
+
+Seeing negative Q-values in CQL is often expected in this codebase:
+
+1. The Bellman target is learned from dataset rewards directly (plus discounted bootstrap), so if rewards are shifted or frequently non-positive, learned Q-values can stay below zero.
+2. For AntMaze tasks, rewards are explicitly shifted by `-1` during offline training, which naturally drives returns and Q-values negative for most transitions.
+3. CQL adds a conservative regularizer (`cql_loss`) that pushes OOD action-values downward; with large `cql_alpha`, the reported mean `q` can become more negative even when policy quality improves.
+
+In short: monitor evaluation return in addition to raw Q statistics; negative Q by itself is not necessarily a bug.

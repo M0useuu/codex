@@ -84,7 +84,7 @@ class CQLLearner(Agent):
         actions = action_space.sample()
 
         if target_entropy is None:
-            target_entropy = -action_dim / 2
+            target_entropy = -action_dim
 
         rng = jax.random.PRNGKey(seed)
         rng, actor_key, critic_key, temp_key, cql_alpha_key = jax.random.split(rng, 5)
