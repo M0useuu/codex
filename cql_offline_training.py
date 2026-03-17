@@ -1,5 +1,6 @@
 #! /usr/bin/env python
 import os
+from typing import Tuple
 
 import d4rl
 import d4rl.gym_mujoco
@@ -50,6 +51,36 @@ config_flags.DEFINE_config_file(
 )
 
 
+def compute_mean_std(observations, eps: float = 1e-3) -> Tuple:
+    mean = observations.mean(axis=0)
+    std = observations.std(axis=0) + eps
+    return mean, std
+
+
+def normalize_states(states, mean, std):
+    return (states - mean) / std
+
+
+def maybe_modify_reward(dataset_dict, env_name: str, reward_scale: float, reward_bias: float):
+    if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
+        # Match common D4RL normalization: scale rewards to roughly per-episode horizon.
+        episode_returns = []
+        episode_return = 0.0
+        for r, done in zip(dataset_dict["rewards"], dataset_dict["dones"]):
+            episode_return += float(r)
+            if done:
+                episode_returns.append(episode_return)
+                episode_return = 0.0
+
+        if episode_returns:
+            ret_min, ret_max = min(episode_returns), max(episode_returns)
+            if ret_max > ret_min:
+                dataset_dict["rewards"] /= ret_max - ret_min
+                dataset_dict["rewards"] *= 1000.0
+
+    dataset_dict["rewards"] = dataset_dict["rewards"] * reward_scale + reward_bias
+
+
 def main(_):
     if FLAGS.offline_checkpoint_dir is None:
         raise ValueError("--offline_checkpoint_dir must be provided for offline training.")
@@ -66,8 +97,35 @@ def main(_):
     else:
         ds = D4RLDataset(env)
 
+    if getattr(FLAGS.config, "normalize_reward", False):
+        maybe_modify_reward(
+            ds.dataset_dict,
+            FLAGS.env_name,
+            reward_scale=getattr(FLAGS.config, "reward_scale", 1.0),
+            reward_bias=getattr(FLAGS.config, "reward_bias", 0.0),
+        )
+
+    state_mean, state_std = None, None
+    if getattr(FLAGS.config, "normalize_states", False):
+        state_mean, state_std = compute_mean_std(ds.dataset_dict["observations"])
+        ds.dataset_dict["observations"] = normalize_states(
+            ds.dataset_dict["observations"], state_mean, state_std
+        )
+        ds.dataset_dict["next_observations"] = normalize_states(
+            ds.dataset_dict["next_observations"], state_mean, state_std
+        )
+
+        def normalize_state(obs):
+            return (obs - state_mean) / state_std
+
+        env = gym.wrappers.TransformObservation(env, normalize_state)
+
     eval_env = gym.make(FLAGS.env_name)
     eval_env = wrap_gym(eval_env, rescale_actions=True)
+    if state_mean is not None:
+        eval_env = gym.wrappers.TransformObservation(
+            eval_env, lambda obs: (obs - state_mean) / state_std
+        )
     eval_env.seed(FLAGS.seed + 42)
 
     kwargs = dict(FLAGS.config)
@@ -78,7 +136,7 @@ def main(_):
 
     for i in tqdm.tqdm(range(FLAGS.pretrain_steps), smoothing=0.1, disable=not FLAGS.tqdm):
         offline_batch = ds.sample(FLAGS.batch_size * FLAGS.offline_utd_ratio)
-        if "antmaze" in FLAGS.env_name:
+        if "antmaze" in FLAGS.env_name and not getattr(FLAGS.config, "normalize_reward", False):
             offline_batch["rewards"] = offline_batch["rewards"] - 1
 
         agent, update_info = agent.update(offline_batch, FLAGS.offline_utd_ratio)

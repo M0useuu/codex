@@ -1,6 +1,5 @@
 from configs import sac_config
 
-
 def get_config():
     config = sac_config.get_config()
 
@@ -17,4 +16,9 @@ def get_config():
     config.cql_target_action_gap = -1.0
     config.cql_alpha_lr = 3e-4
 
+    # Optional dataset/environment preprocessing inspired by reference CQL implementation.
+    config.normalize_states = False
+    config.normalize_reward = False
+    config.reward_scale = 1.0
+    config.reward_bias = 0.0
     return config
