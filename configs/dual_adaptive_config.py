@@ -9,6 +9,6 @@ def get_config():
     
     config.action_selection_temperature = 1.0
     config.ensemble_ratio = 1.0
-    config.actor_bc_coef = 0
+    config.actor_bc_coef = 1.0
 
     return config
