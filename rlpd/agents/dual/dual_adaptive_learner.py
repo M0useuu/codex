@@ -168,6 +168,55 @@ class DualAdaptiveLearner(Agent):
             alpha_multiplier=alpha_multiplier,
         )
 
+    @staticmethod
+    def _debug_tensor_stats(name: str, value: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        value = jnp.asarray(value)
+        return {
+            f"debug/{name}_mean": jnp.mean(value),
+            f"debug/{name}_std": jnp.std(value),
+            f"debug/{name}_min": jnp.min(value),
+            f"debug/{name}_max": jnp.max(value),
+            f"debug/{name}_nan_ratio": jnp.mean(jnp.isnan(value).astype(jnp.float32)),
+            f"debug/{name}_inf_ratio": jnp.mean(jnp.isinf(value).astype(jnp.float32)),
+        }
+
+    @staticmethod
+    def _debug_tree_stats(name: str, tree) -> Dict[str, jnp.ndarray]:
+        leaves = jax.tree_util.tree_leaves(tree)
+        norms = []
+        nan_flags = []
+        inf_flags = []
+        for leaf in leaves:
+            leaf = jnp.asarray(leaf)
+            norms.append(jnp.sum(jnp.square(jnp.nan_to_num(leaf, nan=0.0, posinf=0.0, neginf=0.0))))
+            nan_flags.append(jnp.any(jnp.isnan(leaf)).astype(jnp.float32))
+            inf_flags.append(jnp.any(jnp.isinf(leaf)).astype(jnp.float32))
+        return {
+            f"debug/{name}_l2": jnp.sqrt(jnp.sum(jnp.stack(norms))),
+            f"debug/{name}_has_nan": jnp.max(jnp.stack(nan_flags)),
+            f"debug/{name}_has_inf": jnp.max(jnp.stack(inf_flags)),
+        }
+
+    # DEBUG_BLOCK_START: remove this helper together with callsites when debugging is done.
+    @staticmethod
+    def _debug_nan_alert(name: str, value: jnp.ndarray) -> Dict[str, jnp.ndarray]:
+        value = jnp.asarray(value)
+        all_finite = jnp.all(jnp.isfinite(value))
+
+        def _on_non_finite(_):
+            jax.debug.print(
+                f"[DualAdaptiveLearner][NaNAlert] {name}: nan_ratio={{nan_ratio}}, inf_ratio={{inf_ratio}}, min={{vmin}}, max={{vmax}}",
+                nan_ratio=jnp.mean(jnp.isnan(value).astype(jnp.float32)),
+                inf_ratio=jnp.mean(jnp.isinf(value).astype(jnp.float32)),
+                vmin=jnp.nanmin(value),
+                vmax=jnp.nanmax(value),
+            )
+            return jnp.array(0, dtype=jnp.int32)
+
+        jax.lax.cond(all_finite, lambda _: jnp.array(0, dtype=jnp.int32), _on_non_finite, operand=None)
+        return {f"debug/{name}_all_finite": all_finite.astype(jnp.float32)}
+    # DEBUG_BLOCK_END
+
     def _q_for_action(self, observations: jnp.ndarray, actions: jnp.ndarray, critic: TrainState):
         qs = critic.apply_fn({"params": critic.params}, observations, actions, False)
         return qs.min(axis=0)
@@ -191,6 +240,18 @@ class DualAdaptiveLearner(Agent):
         q1 = self._q_for_action(obs, a1, self.critic)
         q2 = self._q_for_action(obs, a2, self.critic2)
         logits = jnp.stack([q1, q2], axis=-1) * self.action_selection_temperature
+
+        # DEBUG_BLOCK_START: remove _debug_nan_alert(...) lines in this block when done.
+        _ = self._debug_nan_alert("sample/pre_tanh_mean1", dist1.distribution.mean())
+        _ = self._debug_nan_alert("sample/pre_tanh_std1", dist1.distribution.stddev())
+        _ = self._debug_nan_alert("sample/pre_tanh_mean2", dist2.distribution.mean())
+        _ = self._debug_nan_alert("sample/pre_tanh_std2", dist2.distribution.stddev())
+        _ = self._debug_nan_alert("sample/a1", a1)
+        _ = self._debug_nan_alert("sample/a2", a2)
+        _ = self._debug_nan_alert("sample/q1", q1)
+        _ = self._debug_nan_alert("sample/q2", q2)
+        _ = self._debug_nan_alert("sample/logits", logits)
+        # DEBUG_BLOCK_END
 
         key, rng = jax.random.split(rng)
         idx = jax.random.categorical(key, logits=logits, axis=-1)
@@ -309,6 +370,22 @@ class DualAdaptiveLearner(Agent):
             "target_q0": mixed0.mean(),
             "target_q1": mixed1.mean(),
         }
+        # DEBUG_BLOCK_START: remove stats.update(...) debug lines in this block when done.
+        stats.update(self._debug_tensor_stats("next_obs", next_obs))
+        stats.update(self._debug_tensor_stats("next_actions1", next_actions1))
+        stats.update(self._debug_tensor_stats("next_actions2", next_actions2))
+        stats.update(self._debug_tensor_stats("q1_ens", q1_ens))
+        stats.update(self._debug_tensor_stats("q2_ens", q2_ens))
+        stats.update(self._debug_tensor_stats("unc", unc))
+        stats.update(self._debug_tensor_stats("gap0", gap0))
+        stats.update(self._debug_tensor_stats("gap1", gap1))
+        stats.update(self._debug_tensor_stats("ratio0", ratio0))
+        stats.update(self._debug_tensor_stats("ratio1", ratio1))
+        stats.update(self._debug_tensor_stats("mixed0", mixed0))
+        stats.update(self._debug_tensor_stats("mixed1", mixed1))
+        stats.update(self._debug_tensor_stats("target0", target0))
+        stats.update(self._debug_tensor_stats("target1", target1))
+        # DEBUG_BLOCK_END
         return target0, target1, stats, rng
 
     def _update_critic(self, batch: DatasetDict):
@@ -341,6 +418,12 @@ class DualAdaptiveLearner(Agent):
                 "critic1_q": qs0.mean(),
                 "critic2_q": qs1.mean(),
             }
+            # DEBUG_BLOCK_START: remove info.update(...) debug lines in this block when done.
+            info.update(self._debug_tensor_stats("critic_qs0", qs0))
+            info.update(self._debug_tensor_stats("critic_qs1", qs1))
+            info.update(self._debug_tensor_stats("critic_target0", target0))
+            info.update(self._debug_tensor_stats("critic_target1", target1))
+            # DEBUG_BLOCK_END
             return total, info
 
         (grads0, grads1), info = jax.grad(critic_loss_fn, argnums=(0, 1), has_aux=True)(
@@ -349,6 +432,13 @@ class DualAdaptiveLearner(Agent):
 
         critic1 = self.critic.apply_gradients(grads=grads0)
         critic2 = self.critic2.apply_gradients(grads=grads1)
+
+        # DEBUG_BLOCK_START: remove info.update(...) debug lines in this block when done.
+        info.update(self._debug_tree_stats("critic1_grads", grads0))
+        info.update(self._debug_tree_stats("critic2_grads", grads1))
+        info.update(self._debug_tree_stats("critic1_params", critic1.params))
+        info.update(self._debug_tree_stats("critic2_params", critic2.params))
+        # DEBUG_BLOCK_END
 
         target_critic1_params = optax.incremental_update(
             critic1.params, self.target_critic.params, self.tau
@@ -418,11 +508,34 @@ class DualAdaptiveLearner(Agent):
                 "entropy2": -log_pi1.mean(),
                 "log_pi2": log_pi1.mean(),
             }
+            # DEBUG_BLOCK_START: remove info.update(...) debug lines in this block when done.
+            info.update(self._debug_tensor_stats("actor_new_actions0", new_actions0))
+            info.update(self._debug_tensor_stats("actor_new_actions1", new_actions1))
+            info.update(self._debug_tensor_stats("actor_log_pi0", log_pi0))
+            info.update(self._debug_tensor_stats("actor_log_pi1", log_pi1))
+            info.update(self._debug_tensor_stats("actor_q0", q0))
+            info.update(self._debug_tensor_stats("actor_q1", q1))
+            info.update(self._debug_nan_alert("actor/pre_tanh_mean0", dist0.distribution.mean()))
+            info.update(self._debug_nan_alert("actor/pre_tanh_std0", dist0.distribution.stddev()))
+            info.update(self._debug_nan_alert("actor/pre_tanh_mean1", dist1.distribution.mean()))
+            info.update(self._debug_nan_alert("actor/pre_tanh_std1", dist1.distribution.stddev()))
+            info.update(self._debug_nan_alert("actor/new_actions0", new_actions0))
+            info.update(self._debug_nan_alert("actor/new_actions1", new_actions1))
+            info.update(self._debug_nan_alert("actor/log_pi0", log_pi0))
+            info.update(self._debug_nan_alert("actor/log_pi1", log_pi1))
+            info.update(self._debug_nan_alert("actor/q0", q0))
+            info.update(self._debug_nan_alert("actor/q1", q1))
+            # DEBUG_BLOCK_END
             return total_loss, info
 
         (grads0, grads1), info = jax.grad(actor_loss_fn, argnums=(0, 1), has_aux=True)(
             self.actor.params, self.actor2.params
         )
+
+        # DEBUG_BLOCK_START: remove info.update(...) debug lines in this block when done.
+        info.update(self._debug_tree_stats("actor1_grads", grads0))
+        info.update(self._debug_tree_stats("actor2_grads", grads1))
+        # DEBUG_BLOCK_END
 
         return (
             self.replace(
@@ -447,12 +560,20 @@ class DualAdaptiveLearner(Agent):
         g1, i1 = jax.grad(t1_loss_fn, has_aux=True)(self.temp.params)
         g2, i2 = jax.grad(t2_loss_fn, has_aux=True)(self.temp2.params)
 
+        info = {**i1, **i2}
+        # DEBUG_BLOCK_START: remove info.update(...) debug lines in this block when done.
+        info.update(self._debug_tree_stats("temp1_grads", g1))
+        info.update(self._debug_tree_stats("temp2_grads", g2))
+        info.update(self._debug_tree_stats("temp1_params", self.temp.params))
+        info.update(self._debug_tree_stats("temp2_params", self.temp2.params))
+        # DEBUG_BLOCK_END
+
         return (
             self.replace(
                 temp=self.temp.apply_gradients(grads=g1),
                 temp2=self.temp2.apply_gradients(grads=g2),
             ),
-            {**i1, **i2},
+            info,
         )
 
     @partial(jax.jit, static_argnames="utd_ratio")
