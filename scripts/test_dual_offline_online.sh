@@ -20,21 +20,20 @@ fi
 mkdir -p "$OFFLINE_CKPT_DIR"
 
 # 可按需改环境名
-ENV_NAME="halfcheetah-expert-v2"
+ENV_NAME="walker2d-medium-v2"
 SEED=42
 
 # 快速 smoke 参数（可直接跑通流程）
-OFFLINE_PRETRAIN_STEPS=50
-ONLINE_MAX_STEPS=100
-START_TRAINING=10
-BATCH_SIZE=64
-LOG_INTERVAL=10
-EVAL_INTERVAL=50
+OFFLINE_PRETRAIN_STEPS=50000
+ONLINE_MAX_STEPS=50000
+START_TRAINING=5000
+BATCH_SIZE=256
+LOG_INTERVAL=1000
+EVAL_INTERVAL=5000
 
 # 避免 XLA 预分配占满显存
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# 避免 JAX 探测 rocm/tpu 后打印误导性日志（仅用于 smoke 测试）
-export JAX_PLATFORMS=${JAX_PLATFORMS:-cpu}
+
 
 echo "[1/2] Running dual offline pretraining..."
 python dual_offline_training.py \
