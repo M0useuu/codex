@@ -13,13 +13,12 @@ from flax.training import checkpoints
 from ml_collections import config_flags
 
 from utils import combine, d4rl_normalize_return, prefixed
-from rlpd.agents import CQLLearner, SACLearner
+from rlpd.agents import DualAdaptiveLearner
 from rlpd.data import ReplayBuffer
+from rlpd.data.binary_datasets import BinaryDataset
 from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
 from rlpd.wrappers import wrap_gym
-
-from rlpd.data.binary_datasets import BinaryDataset
 
 FLAGS = flags.FLAGS
 
@@ -49,27 +48,76 @@ flags.DEFINE_boolean(
 flags.DEFINE_string(
     "offline_checkpoint_dir",
     None,
-    "Directory of offline weights. Online finetuning must load from this dir.",
+    "Absolute directory of offline CQL weights. Online finetuning loads agent1 and agent2 from this dir.",
 )
 
 config_flags.DEFINE_config_file(
     "config",
-    "configs/cql_config.py",
+    "configs/dual_adaptive_config.py",
     "File path to the training hyperparameter configuration.",
     lock_config=False,
 )
+
+
+def _load_pretrained_dual_agent(agent, checkpoint_dir):
+    agent1_dir = os.path.join(checkpoint_dir, "agent1")
+    agent2_dir = os.path.join(checkpoint_dir, "agent2")
+
+    if (
+        checkpoints.latest_checkpoint(agent1_dir) is None
+        or checkpoints.latest_checkpoint(agent2_dir) is None
+    ):
+        raise FileNotFoundError(
+            "No checkpoint found. Expected both "
+            "'<offline_checkpoint_dir>/agent1' and '<offline_checkpoint_dir>/agent2'."
+        )
+
+    agent1_state = checkpoints.restore_checkpoint(
+        agent1_dir,
+        target={
+            "actor": agent.actor,
+            "critic": agent.critic,
+            "target_critic": agent.target_critic,
+            "temp": agent.temp,
+        },
+    )
+    agent2_state = checkpoints.restore_checkpoint(
+        agent2_dir,
+        target={
+            "actor": agent.actor2,
+            "critic": agent.critic2,
+            "target_critic": agent.target_critic2,
+            "temp": agent.temp2,
+        },
+    )
+
+    return agent.replace(
+        actor=agent1_state["actor"],
+        critic=agent1_state["critic"],
+        target_critic=agent1_state["target_critic"],
+        temp=agent1_state["temp"],
+        actor2=agent2_state["actor"],
+        critic2=agent2_state["critic"],
+        target_critic2=agent2_state["target_critic"],
+        temp2=agent2_state["temp"],
+    )
 
 
 def main(_):
     assert 0.0 <= FLAGS.offline_ratio <= 1.0
     if FLAGS.offline_checkpoint_dir is None:
         raise ValueError("--offline_checkpoint_dir must be provided for online finetuning.")
+    if not os.path.isabs(FLAGS.offline_checkpoint_dir):
+        raise ValueError(
+            "--offline_checkpoint_dir must be an absolute path, "
+            f"got: {FLAGS.offline_checkpoint_dir}"
+        )
 
     wandb.init(project=FLAGS.project_name)
     wandb.config.update(FLAGS)
 
-    exp_prefix = f"s{FLAGS.seed}_online"
-    log_dir = os.path.join(FLAGS.log_dir, exp_prefix)
+    exp_prefix = f"s{FLAGS.seed}_dual_online"
+    log_dir = os.path.abspath(os.path.join(FLAGS.log_dir, exp_prefix))
 
     if FLAGS.checkpoint_model:
         chkpt_dir = os.path.join(log_dir, "checkpoints")
@@ -99,12 +147,7 @@ def main(_):
         FLAGS.seed, env.observation_space, env.action_space, **kwargs
     )
 
-    latest_ckpt = checkpoints.latest_checkpoint(FLAGS.offline_checkpoint_dir)
-    if latest_ckpt is None:
-        raise FileNotFoundError(
-            f"No checkpoint found in --offline_checkpoint_dir={FLAGS.offline_checkpoint_dir}."
-        )
-    agent = checkpoints.restore_checkpoint(FLAGS.offline_checkpoint_dir, target=agent)
+    agent = _load_pretrained_dual_agent(agent, FLAGS.offline_checkpoint_dir)
 
     replay_buffer = ReplayBuffer(
         env.observation_space, env.action_space, FLAGS.max_steps

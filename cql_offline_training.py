@@ -10,7 +10,7 @@ from absl import app, flags
 from flax.training import checkpoints
 from ml_collections import config_flags
 
-from cql_finetuning_utils import d4rl_normalize_return, prefixed
+from utils import d4rl_normalize_return, prefixed
 from rlpd.agents import CQLLearner, SACLearner
 from rlpd.data.d4rl_datasets import D4RLDataset
 from rlpd.evaluation import evaluate
